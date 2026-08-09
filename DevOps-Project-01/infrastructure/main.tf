@@ -58,9 +58,10 @@ module "rds" {
 module "alb" {
   source = "./modules/alb"
 
-  environment     = var.environment
-  vpc_id         = module.vpc.vpc_id
-  public_subnets = module.vpc.public_subnet_ids
+  environment            = var.environment
+  vpc_id                 = module.vpc.vpc_id
+  public_subnets         = module.vpc.public_subnet_ids
+  alb_security_group_id  = module.security.alb_security_group_id
 }
 
 # Auto Scaling Group Module
@@ -86,4 +87,4 @@ module "monitoring" {
   environment = var.environment
   rds_instance_id = module.rds.rds_instance_id
   asg_name = module.asg.asg_name
-} 
+}
