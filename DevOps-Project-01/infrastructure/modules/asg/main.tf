@@ -1,8 +1,23 @@
 # ASG Module
 
+data "aws_ami" "amazon_linux" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["amzn2-ami-hvm-*-x86_64-gp2"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+}
+
 resource "aws_launch_template" "main" {
   name_prefix   = "${var.environment}-lt"
-  image_id      = "ami-0c02fb55956c7d316" # Amazon Linux 2
+  image_id      = data.aws_ami.amazon_linux.id
   instance_type = var.instance_type
   key_name      = var.key_name
 
