@@ -64,6 +64,16 @@ module "alb" {
   alb_security_group_id  = module.security.alb_security_group_id
 }
 
+# Bastion Host Module
+module "bastion" {
+  source = "./modules/bastion"
+
+  environment               = var.environment
+  public_subnet_id          = module.vpc.public_subnet_ids[0]
+  bastion_security_group_id = module.security.bastion_security_group_id
+  key_name                  = var.key_name
+}
+
 # Auto Scaling Group Module
 module "asg" {
   source = "./modules/asg"
@@ -88,3 +98,4 @@ module "monitoring" {
   rds_instance_id = module.rds.rds_instance_id
   asg_name = module.asg.asg_name
 }
+
