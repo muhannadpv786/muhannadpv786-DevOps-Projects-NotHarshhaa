@@ -1,0 +1,470 @@
+pipeline {
+
+    agent any
+
+    environment {
+        AWS_REGION      = 'ap-south-1'
+        ENVIRONMENT     = 'dev'
+        ASG_NAME        = 'dev-asg'
+
+        INFRA_DIR       = 'DevOps-Project-01/infrastructure'
+        APP_DIR         = 'DevOps-Project-01/Java-Login-App'
+
+        // Create this bucket before running Jenkins.
+        // Example: muhannad-java-artifacts-ap-south-1
+        ARTIFACT_BUCKET = 'muhannad-java-artifacts-ap-south-1'
+
+        ARTIFACT_NAME   = "java-login-app-${BUILD_NUMBER}.war"
+        S3_ARTIFACT     = "s3://${ARTIFACT_BUCKET}/java-login-app/${BUILD_NUMBER}/java-login-app.war"
+
+        AWS_DEFAULT_REGION = 'ap-south-1'
+    }
+
+    stages {
+
+        stage('Checkout Application') {
+            steps {
+                echo "Checking out application repository..."
+
+                checkout scm
+
+                sh '''
+                    echo "Current directory:"
+                    pwd
+
+                    echo "Repository files:"
+                    ls -la
+
+                    echo "Checking application directory:"
+                    ls -la ${APP_DIR}
+                '''
+            }
+        }
+
+        stage('Verify Tools') {
+            steps {
+                sh '''
+                    echo "Checking required tools..."
+
+                    terraform version
+                    aws --version
+                    java -version
+                    mvn -version
+
+                    echo "AWS identity:"
+                    aws sts get-caller-identity
+                '''
+            }
+        }
+
+        stage('Terraform Init') {
+            steps {
+                dir("${INFRA_DIR}") {
+
+                    sh '''
+                        echo "Initializing Terraform..."
+
+                        terraform init \
+                            -input=false \
+                            -upgrade
+                    '''
+                }
+            }
+        }
+
+        stage('Terraform Validate') {
+            steps {
+                dir("${INFRA_DIR}") {
+
+                    sh '''
+                        echo "Validating Terraform..."
+
+                        terraform fmt -check -recursive
+                        terraform validate
+                    '''
+                }
+            }
+        }
+
+        stage('Terraform Plan') {
+            steps {
+                dir("${INFRA_DIR}") {
+
+                    sh '''
+                        echo "Creating Terraform plan..."
+
+                        terraform plan \
+                            -input=false \
+                            -out=tfplan
+                    '''
+                }
+            }
+        }
+
+        stage('Terraform Apply') {
+            steps {
+                input message: 'Apply Terraform infrastructure?', 
+                      ok: 'Apply Infrastructure'
+
+                dir("${INFRA_DIR}") {
+
+                    sh '''
+                        echo "Applying Terraform infrastructure..."
+
+                        terraform apply \
+                            -input=false \
+                            -auto-approve \
+                            tfplan
+                    '''
+                }
+            }
+        }
+
+        stage('Get Infrastructure Details') {
+            steps {
+                dir("${INFRA_DIR}") {
+
+                    sh '''
+                        echo "Terraform outputs:"
+                        terraform output
+
+                        echo ""
+                        echo "ALB DNS:"
+                        terraform output -raw alb_dns_name || true
+                    '''
+
+                    script {
+                        env.ALB_DNS = sh(
+                            script: "terraform output -raw alb_dns_name",
+                            returnStdout: true
+                        ).trim()
+
+                        echo "ALB DNS: ${env.ALB_DNS}"
+                    }
+                }
+            }
+        }
+
+        stage('Wait for EC2 Instances') {
+            steps {
+                sh '''
+                    echo "Waiting for Auto Scaling Group instances..."
+
+                    for i in {1..30}
+                    do
+
+                        INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
+                            --auto-scaling-group-names "${ASG_NAME}" \
+                            --region "${AWS_REGION}" \
+                            --query 'AutoScalingGroups[0].Instances[?LifecycleState==`InService`].InstanceId' \
+                            --output text)
+
+                        echo "InService instances: ${INSTANCE_IDS}"
+
+                        if [ -n "${INSTANCE_IDS}" ] && [ "${INSTANCE_IDS}" != "None" ]
+                        then
+                            echo "EC2 instances are InService."
+                            break
+                        fi
+
+                        echo "Waiting for EC2 instances..."
+                        sleep 20
+
+                    done
+
+                    if [ -z "${INSTANCE_IDS}" ] || [ "${INSTANCE_IDS}" = "None" ]
+                    then
+                        echo "ERROR: EC2 instances did not become InService."
+                        exit 1
+                    fi
+
+                    echo "EC2 instances:"
+                    echo "${INSTANCE_IDS}"
+                '''
+            }
+        }
+
+        stage('Check SSM Connectivity') {
+            steps {
+                sh '''
+                    echo "Checking AWS Systems Manager connectivity..."
+
+                    INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
+                        --auto-scaling-group-names "${ASG_NAME}" \
+                        --region "${AWS_REGION}" \
+                        --query 'AutoScalingGroups[0].Instances[?LifecycleState==`InService`].InstanceId' \
+                        --output text)
+
+                    echo "Instances: ${INSTANCE_IDS}"
+
+                    for INSTANCE_ID in ${INSTANCE_IDS}
+                    do
+                        echo "Checking SSM status for ${INSTANCE_ID}..."
+
+                        STATUS=$(aws ssm describe-instance-information \
+                            --region "${AWS_REGION}" \
+                            --filters "Key=InstanceIds,Values=${INSTANCE_ID}" \
+                            --query 'InstanceInformationList[0].PingStatus' \
+                            --output text)
+
+                        echo "${INSTANCE_ID}: ${STATUS}"
+
+                        if [ "${STATUS}" != "Online" ]
+                        then
+                            echo "ERROR: ${INSTANCE_ID} is not Online in SSM."
+                            exit 1
+                        fi
+                    done
+
+                    echo "All EC2 instances are available through SSM."
+                '''
+            }
+        }
+
+        stage('Build Application') {
+            steps {
+                dir("${APP_DIR}") {
+
+                    sh '''
+                        echo "Building Java application..."
+
+                        chmod +x mvnw
+
+                        ./mvnw clean test
+
+                        ./mvnw clean package -DskipTests
+
+                        echo ""
+                        echo "Generated WAR files:"
+                        ls -lh target/*.war
+                    '''
+                }
+            }
+        }
+
+        stage('Prepare Artifact') {
+            steps {
+                dir("${APP_DIR}") {
+
+                    sh '''
+                        echo "Preparing WAR artifact..."
+
+                        WAR_FILE=$(find target -maxdepth 1 -type f -name "*.war" | head -n 1)
+
+                        if [ -z "${WAR_FILE}" ]
+                        then
+                            echo "ERROR: WAR file not found."
+                            exit 1
+                        fi
+
+                        echo "WAR file: ${WAR_FILE}"
+
+                        cp "${WAR_FILE}" "${WORKSPACE}/${ARTIFACT_NAME}"
+
+                        ls -lh "${WORKSPACE}/${ARTIFACT_NAME}"
+                    '''
+                }
+            }
+        }
+
+        stage('Upload WAR to S3') {
+            steps {
+
+                sh '''
+                    echo "Uploading WAR to S3..."
+
+                    aws s3 cp \
+                        "${WORKSPACE}/${ARTIFACT_NAME}" \
+                        "${S3_ARTIFACT}" \
+                        --region "${AWS_REGION}"
+
+                    echo "Artifact uploaded:"
+                    echo "${S3_ARTIFACT}"
+                '''
+            }
+        }
+
+        stage('Deploy to EC2 via SSM') {
+            steps {
+
+                sh '''
+                    echo "Discovering EC2 instances..."
+
+                    INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
+                        --auto-scaling-group-names "${ASG_NAME}" \
+                        --region "${AWS_REGION}" \
+                        --query 'AutoScalingGroups[0].Instances[?LifecycleState==`InService`].InstanceId' \
+                        --output text)
+
+                    echo "Deploying to:"
+                    echo "${INSTANCE_IDS}"
+
+                    COMMAND_ID=$(aws ssm send-command \
+                        --region "${AWS_REGION}" \
+                        --instance-ids ${INSTANCE_IDS} \
+                        --document-name "AWS-RunShellScript" \
+                        --comment "Deploy Java application ${BUILD_NUMBER}" \
+                        --parameters 'commands=[
+                            "set -e",
+                            "echo Starting application deployment",
+                            "mkdir -p /tmp/java-deployment",
+                            "aws s3 cp '${S3_ARTIFACT}' /tmp/java-deployment/application.war --region '${AWS_REGION}'",
+                            "systemctl stop tomcat",
+                            "rm -f /var/lib/tomcat/webapps/*.war",
+                            "rm -rf /var/lib/tomcat/webapps/*",
+                            "cp /tmp/java-deployment/application.war /var/lib/tomcat/webapps/java-login-app.war",
+                            "chown tomcat:tomcat /var/lib/tomcat/webapps/java-login-app.war",
+                            "systemctl start tomcat",
+                            "systemctl enable tomcat",
+                            "sleep 15",
+                            "systemctl is-active --quiet tomcat",
+                            "echo Application deployment completed successfully"
+                        ]' \
+                        --query 'Command.CommandId' \
+                        --output text)
+
+                    echo "SSM Command ID: ${COMMAND_ID}"
+
+                    echo "Waiting for deployment..."
+
+                    for i in {1..30}
+                    do
+
+                        STATUS=$(aws ssm list-command-invocations \
+                            --command-id "${COMMAND_ID}" \
+                            --details \
+                            --region "${AWS_REGION}" \
+                            --query 'CommandInvocations[].Status' \
+                            --output text)
+
+                        echo "Deployment status: ${STATUS}"
+
+                        case "${STATUS}" in
+
+                            *Failed*)
+                                echo "ERROR: Deployment failed."
+                                aws ssm list-command-invocations \
+                                    --command-id "${COMMAND_ID}" \
+                                    --details \
+                                    --region "${AWS_REGION}"
+                                exit 1
+                                ;;
+
+                            *Cancelled*)
+                                echo "ERROR: Deployment cancelled."
+                                exit 1
+                                ;;
+
+                            *TimedOut*)
+                                echo "ERROR: Deployment timed out."
+                                exit 1
+                                ;;
+
+                            *Success*)
+                                echo "Deployment successful."
+                                break
+                                ;;
+
+                            *)
+                                echo "Deployment still running..."
+                                sleep 10
+                                ;;
+                        esac
+
+                    done
+                '''
+            }
+        }
+
+        stage('Application Health Check') {
+            steps {
+
+                sh '''
+                    echo "Waiting for ALB health check..."
+
+                    for i in {1..30}
+                    do
+
+                        HTTP_CODE=$(curl \
+                            -k \
+                            -L \
+                            -s \
+                            -o /dev/null \
+                            -w "%{http_code}" \
+                            "http://${ALB_DNS}/")
+
+                        echo "ALB HTTP status: ${HTTP_CODE}"
+
+                        if [ "${HTTP_CODE}" = "200" ] || \
+                           [ "${HTTP_CODE}" = "302" ] || \
+                           [ "${HTTP_CODE}" = "301" ]
+                        then
+                            echo "Application is responding."
+                            exit 0
+                        fi
+
+                        echo "Waiting for application..."
+                        sleep 10
+
+                    done
+
+                    echo "ERROR: Application health check failed."
+
+                    echo "ALB:"
+                    echo "${ALB_DNS}"
+
+                    exit 1
+                '''
+            }
+        }
+
+    }
+
+    post {
+
+        success {
+            echo """
+            ============================================
+            DEPLOYMENT SUCCESSFUL
+            ============================================
+
+            Environment : ${ENVIRONMENT}
+            AWS Region  : ${AWS_REGION}
+            Build       : ${BUILD_NUMBER}
+
+            ALB:
+            http://${ALB_DNS}
+
+            ============================================
+            """
+        }
+
+        failure {
+            echo """
+            ============================================
+            DEPLOYMENT FAILED
+            ============================================
+
+            Build: ${BUILD_NUMBER}
+
+            Check Jenkins console output.
+
+            ============================================
+            """
+        }
+
+        always {
+            echo "Cleaning Jenkins workspace..."
+
+            sh '''
+                rm -f "${WORKSPACE}/${ARTIFACT_NAME}" || true
+                rm -f "${WORKSPACE}/${INFRA_DIR}/tfplan" || true
+            '''
+
+            cleanWs(
+                deleteDirs: true,
+                disableDeferredWipeout: true
+            )
+        }
+    }
+}
