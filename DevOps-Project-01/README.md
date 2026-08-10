@@ -22,6 +22,8 @@
 
 ---
 
+ssh -i "C:\Users\MUHANNAD\.ssh\testhp.pem" ubuntu@13.233.130.151
+
 ![3-tier Architecture Diagram](https://imgur.com/3XF0tlJ.png)
 
 ---
